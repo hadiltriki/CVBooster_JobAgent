@@ -98,6 +98,14 @@ function ATSModal({
     return () => window.removeEventListener("keydown", handler);
   }, [onClose]);
 
+  const handleEnhanceCV = () => {
+    if (!userId || !job?.url) return;
+    const atsBefore = Number(data?.total_score);
+    const atsParam = Number.isFinite(atsBefore) ? `&ats_before=${encodeURIComponent(String(atsBefore))}` : "";
+    // Open enhance UI flow on /cv-boost page in a new tab.
+    window.open(`/cv-boost?user_id=${userId}&job_id=${encodeURIComponent(job.url)}${atsParam}`, "_blank");
+  };
+
   return (
     <div onClick={onClose} style={{ position: "fixed", inset: 0, background: "rgba(20,10,35,.65)", backdropFilter: "blur(8px)", zIndex: 2000, display: "flex", alignItems: "center", justifyContent: "center", padding: 20, overflowY: "auto" }}>
       <div onClick={e => e.stopPropagation()} style={{ background: C.white, borderRadius: 20, width: "100%", maxWidth: 680, maxHeight: "90vh", overflowY: "auto", boxShadow: "0 24px 80px rgba(20,10,35,.35)", animation: "modalIn .25s cubic-bezier(.34,1.56,.64,1)" }}>
@@ -214,7 +222,7 @@ function ATSModal({
                   style={{ width: "100%", padding: "13px 20px", background: "linear-gradient(135deg, #FF2D7A 0%, #C3379B 50%, #7A3FB0 100%)", border: "none", borderRadius: 12, color: "#fff", fontSize: 13, fontWeight: 700, cursor: "pointer", display: "flex", alignItems: "center", justifyContent: "center", gap: 8, boxShadow: "0 4px 20px rgba(122,63,176,.35)", transition: "opacity .18s, transform .15s" }}
                   onMouseEnter={e => { e.currentTarget.style.opacity = "0.88"; e.currentTarget.style.transform = "translateY(-1px)"; }}
                   onMouseLeave={e => { e.currentTarget.style.opacity = "1"; e.currentTarget.style.transform = "translateY(0)"; }}
-                  onClick={() => window.open(`/cv-boost?user_id=${userId}&job_id=${encodeURIComponent(job.url)}`, "_blank")}
+                  onClick={handleEnhanceCV}
                 >
                   <span style={{ fontSize: 16 }}>✨</span>
                   Enhance my CV for this job
@@ -990,6 +998,8 @@ function Dashboard() {
   const searchParams = useSearchParams();
   const userId       = parseInt(searchParams.get("user_id") || "0", 10);
   const shouldScan   = searchParams.get("scan") === "1";
+  const bootedRef    = useRef(false);
+  const scanInFlightRef = useRef(false);
 
   const [userName,   setUserName]   = useState(`User #${userId}`);
   const [isScanning, setIsScanning] = useState(false);
@@ -1019,7 +1029,21 @@ function Dashboard() {
   const [atsLoading, setAtsLoading] = useState(false);
   const [atsError,   setAtsError]   = useState("");
 
+  function scanJobKey(jobLike: Partial<Job> & { source?: string; title?: string; industry?: string; url?: string }) {
+    const url = (jobLike.url || "").trim();
+    if (url) return `url:${url}`;
+    const source = (jobLike.source || "").trim().toLowerCase();
+    const title = (jobLike.title || "").trim().toLowerCase();
+    const industry = (jobLike.industry || "").trim().toLowerCase();
+    return `fallback:${source}|${title}|${industry}`;
+  }
+
   useEffect(() => {
+    // In Next.js dev (React StrictMode), effects can run twice.
+    // Guard boot logic to avoid starting two scans in parallel.
+    if (bootedRef.current) return;
+    bootedRef.current = true;
+
     if (!userId) { router.replace("/"); return; }
     if (shouldScan) {
       window.history.replaceState({}, "", `/jobs-search?user_id=${userId}&scan=1`);
@@ -1028,7 +1052,7 @@ function Dashboard() {
       window.history.replaceState({}, "", `/jobs-search?user_id=${userId}`);
       fetchUserAndJobs();
     }
-  }, []);
+  }, [userId, shouldScan, router]);
 
   useEffect(() => {
     if (activeTab === "gap"     && userId && !gapData)  { setGapLoad(true);  loadGap(); }
@@ -1151,6 +1175,8 @@ setAtsError("Job description is too short to compute the ATS score.");
   }
 
   async function runScan() {
+    if (scanInFlightRef.current) return;
+    scanInFlightRef.current = true;
     setIsScanning(true);
     setPipeSteps({ ...initPipeSteps(), lang: "active" });
     setPipeRole(""); setScanJobs([]); setEnrichN(0);
@@ -1162,7 +1188,13 @@ setAtsError("Job description is too short to compute the ATS score.");
           cv_raw_text: sessionStorage.getItem("jobscan_cv_text") || "", // ✅ cv_raw_text envoyé
         }),
       });
-      if (!resp.ok || !resp.body) throw new Error("Scan request failed");
+      if (!resp.ok || !resp.body) {
+        const errBody = await resp.text().catch(() => "");
+        // Fallback immediately to cached jobs so UI doesn't stay blocked.
+        setPipeSteps(p => ({ ...p, lang: "done", scrape: "done", enrich: "done" }));
+        await loadJobs();
+        throw new Error(`Scan request failed (${resp.status})${errBody ? `: ${errBody.slice(0, 180)}` : ""}`);
+      }
       const reader = resp.body.getReader();
       const decoder = new TextDecoder();
       let buf = "", enriched = 0;
@@ -1183,13 +1215,28 @@ setAtsError("Job description is too short to compute the ATS score.");
               setPipeSteps(p => ({ ...p, lang: "done", scrape: "active", enrich: "active" }));
               if (d.title) setPipeRole(d.title);
               break;
+            case "job_found":
+              // Do not render raw detected jobs as cards.
+              // They may not pass cosine/matching filters and would show misleading 0.0% scores.
+              break;
             case "source_done":
               setPipeSteps(p => ({ ...p, [d.source]: "done" }));
               break;
             case "job":
               enriched++;
               setEnrichN(enriched);
-              setScanJobs(prev => { if (prev.some(j => j.url === d.url)) return prev; return [...prev, d as Job]; });
+              setScanJobs(prev => {
+                const enrichedJob = d as Job;
+                const incomingKey = scanJobKey(enrichedJob);
+                const idx = prev.findIndex(j => scanJobKey(j) === incomingKey);
+                if (idx >= 0) {
+                  // Replace preview card (0%) with enriched/scored card.
+                  const next = [...prev];
+                  next[idx] = { ...next[idx], ...enrichedJob };
+                  return next;
+                }
+                return [...prev, enrichedJob];
+              });
               break;
             case "done":
               setPipeSteps(p => ({ ...p, lang: "done", scrape: "done", enrich: "done" }));
@@ -1197,15 +1244,26 @@ setAtsError("Job description is too short to compute the ATS score.");
               setScanJobs(prev => { if (prev.length) setJobs([...prev]); return prev; });
               setHasLoaded(true);
               break;
+            case "error":
+              // Backend aborted scan (e.g. missing profile / transient source issue).
+              // Stop waiting so UI doesn't stay indefinitely on "Search in progress...".
+              console.error("Scan SSE error:", d.message || d);
+              setPipeSteps(p => ({ ...p, lang: "done", scrape: "done", enrich: "done" }));
+              reader.cancel();
+              break;
           }
         }
       }
+      // Always refresh from DB after scan so existing jobs (e.g. user 10) still appear
+      // even when current scan yields few or zero streamed results.
+      await loadJobs();
       const r = await fetch(`/api/user/${userId}`);
       if (r.ok) { const d = await r.json(); setUserName(d.name || `User #${userId}`); }
     } catch (err) {
       console.error("Scan error:", err);
     } finally {
       window.history.replaceState({}, "", `/jobs-search?user_id=${userId}`);
+      scanInFlightRef.current = false;
       setIsScanning(false);
     }
   }

@@ -376,6 +376,37 @@ def save_cv_to_cosmos(user_id: str, cv_structured: dict):
         log.info("✅ CosmosDB upsert — user_id: %s", user_id)
     except Exception as e:
         log.error("❌ CosmosDB save failed: %s", str(e))
+def _cosmos_doc_to_cv_text(doc: dict) -> str:
+    """Reconstruit un texte CV depuis les champs structurés CosmosDB (fallback si cv_raw_text vide)."""
+    lines = []
+    name = f"{doc.get('first_name', '')} {doc.get('last_name', '')}".strip()
+    if name:
+        lines.append(name)
+    contact_parts = [p for p in [doc.get("email", ""), doc.get("linkedin", "")] if p]
+    if contact_parts:
+        lines.append("  |  ".join(contact_parts))
+    if doc.get("summary"):
+        lines.append("\nPROFILE")
+        lines.append(doc["summary"])
+    skills = doc.get("skills", "")
+    if skills:
+        lines.append("\nSKILLS")
+        lines.append(skills if isinstance(skills, str) else ", ".join(skills))
+    edu = doc.get("education", "")
+    if edu:
+        lines.append("\nEDUCATION")
+        lines.append(edu if isinstance(edu, str) else str(edu))
+    certs = doc.get("certifications", [])
+    if isinstance(certs, list) and certs:
+        lines.append("\nCERTIFICATIONS")
+        for c in certs:
+            if isinstance(c, dict):
+                lines.append(f"- {c.get('title','')} · {c.get('org','')} {c.get('date','')}".strip())
+    langs = doc.get("languages", "")
+    if langs:
+        lines.append("\nLANGUAGES")
+        lines.append(langs if isinstance(langs, str) else str(langs))
+    return "\n".join(lines)
 # ═════════════════════════════════════════════════════════════════════════════
 # SECTION 5 — LLM CV GENERATION
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1761,8 +1792,17 @@ async def boost_cv(
         lab_ids  = json.loads(include_labs)
         cert_ids = json.loads(include_certs)
         quiz_ok  = include_quiz.lower() == "true"
-
+        job_context_block = ""
+        if job_title or job_description or job_requirements:
+            job_context_block = (
+                f"\n\nTARGET JOB — TAILOR THE CV FOR THIS ROLE:\n"
+                f"Job Title: {job_title}\n"
+                f"Required Skills: {job_requirements[:800]}\n"
+                f"Description: {job_description[:1200]}\n"
+                f"LANGUAGE: Write the entire CV in {_doc_lang.upper()}."
+            )
         clean_text = fix_garbled_certifications(clean_text)
+
         llm_text = generate_cv_with_llm(
             clean_text, platform_data,
             include_quiz=quiz_ok,
@@ -1933,9 +1973,10 @@ async def get_platform_data(user_id: str = FPath(...)):
 
 @enhance_router.post("/enhance-cv-for-job")
 async def enhance_cv_for_job(
-    user_id:   str = Form(""),
-    job_id:    str = Form(""),
-    cv_format: str = Form("ats"),
+    user_id:     str = Form(""),
+    job_id:      str = Form(""),
+    cv_format:   str = Form("ats"),
+    cv_language: str = Form("auto"),   
 ):
     """
     Enhance the user's CV specifically for a job offer.
@@ -1961,9 +2002,13 @@ async def enhance_cv_for_job(
 
     cv_raw_text = user.get("cv_raw_text", "").strip()
     if not cv_raw_text or len(cv_raw_text) < 50:
-        return JSONResponse({
-            "error": "No CV found for this user. Please run a scan first to save your CV."
-        }, status_code=400)
+        # Fallback : reconstruire depuis les champs structurés CosmosDB
+        log.info("[/enhance-cv-for-job] cv_raw_text vide → fallback _cosmos_doc_to_cv_text")
+        cv_raw_text = _cosmos_doc_to_cv_text(user)
+        if not cv_raw_text or len(cv_raw_text) < 50:
+            return JSONResponse({
+                "error": "No CV found. Please run a scan first to save your CV."
+            }, status_code=400)
 
     # ── 2. Load job details from CosmosDB ─────────────────────────────────────
     job_title = ""
@@ -1988,6 +2033,14 @@ async def enhance_cv_for_job(
                 log.warning("⚠ Job not found in DB for url: %s", job_id[:60])
         except Exception as e:
             log.error("Job fetch error: %s", e)
+    _fr_detect = ["et","ou","les","des","dans","pour","avec","sur","une","est",
+                  "par","expérience","formation","compétences","langues"]
+    _fr_hits  = sum(1 for w in _fr_detect if f" {w} " in cv_raw_text.lower())
+    _doc_lang = "French" if _fr_hits >= 4 else "English"
+    if cv_language == "fr":
+        _doc_lang = "French"
+    elif cv_language == "en":
+        _doc_lang = "English"
 
     # ── 3. Build job-targeted system prompt ───────────────────────────────────
     job_context = ""
@@ -2003,6 +2056,7 @@ INSTRUCTIONS FOR THIS JOB:
 - Use keywords from the job description in the profile and skills sections
 - Highlight relevant experience that matches this role
 - Keep all factual information — do NOT invent or exaggerate
+- CRITICAL: Write the ENTIRE CV output in {_doc_lang.upper()} only
 """
 
     # ── 4. Detect domain + platform data ──────────────────────────────────────
@@ -2076,10 +2130,7 @@ INSTRUCTIONS FOR THIS JOB:
              score_after["total"] - score_before["total"])
 
     # ── 8. Detect language + generate DOCX ───────────────────────────────────
-    _fr_detect = ["et","ou","les","des","dans","pour","avec","sur","une","est",
-                  "par","expérience","formation","compétences","langues"]
-    _fr_hits  = sum(1 for w in _fr_detect if f" {w} " in cv_raw_text.lower())
-    _doc_lang = "French" if _fr_hits >= 4 else "English"
+   
 
     docx_bytes = generate_docx(parsed_llm, cv_format, photo_bytes=None, language=_doc_lang)
 

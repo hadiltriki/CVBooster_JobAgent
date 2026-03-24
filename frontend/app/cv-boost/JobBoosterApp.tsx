@@ -9,6 +9,7 @@ import {
 import FormatScreen, { FORMATS } from "./FormatScreen";
 import { deriveImprovements, deriveCompliance, WhatWasImproved, ATSCompliance,
          ImprovementItem, ComplianceItem, ParsedCV } from "../app/components/cv-booster/ResultInsights";
+import "../app/components/cv-booster/CVBoosterApp.css";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SCORE RING
@@ -99,6 +100,7 @@ export default function JobBoosterApp() {
   const [docxName,       setDocxName]       = useState("");
   const [scoreBefore,    setScoreBefore]    = useState<number | null>(null);
   const [scoreAfter,     setScoreAfter]     = useState<number | null>(null);
+  const [beforeFromModal, setBeforeFromModal] = useState(false);
   const [bdBefore,       setBdBefore]       = useState<Record<string,any> | null>(null);
   const [bdAfter,        setBdAfter]        = useState<Record<string,any> | null>(null);
   const [parsedCV,       setParsedCV]       = useState<ParsedCV | null>(null);
@@ -112,8 +114,16 @@ export default function JobBoosterApp() {
     const params  = new URLSearchParams(window.location.search);
     const uid     = params.get("user_id") || "";
     const jid     = params.get("job_id")  || "32e610bd-3b5c-4835-8582-2a135368e74e";
+    const atsRaw  = params.get("ats_before");
     setUserId(uid);
     setJobId(jid);
+    if (atsRaw !== null) {
+      const n = Number(atsRaw);
+      if (Number.isFinite(n)) {
+        setScoreBefore(Math.round(n));
+        setBeforeFromModal(true);
+      }
+    }
 
     fetch(`/job-data/${encodeURIComponent(jid)}`)
       .then(r => r.json())
@@ -142,16 +152,19 @@ export default function JobBoosterApp() {
         throw new Error(err.error || `Server error ${res.status}`);
       }
 
-      const sBefore   = parseInt(res.headers.get("X-ATS-Score-Before") || "0");
-      const sAfter    = parseInt(res.headers.get("X-ATS-Score-After")  || "0");
+      const sBeforeRaw = res.headers.get("X-ATS-Score-Before");
+      const sAfterRaw  = res.headers.get("X-ATS-Score-After");
+      const sBefore    = sBeforeRaw !== null ? Number.parseInt(sBeforeRaw, 10) : Number.NaN;
+      const sAfter     = sAfterRaw  !== null ? Number.parseInt(sAfterRaw, 10)  : Number.NaN;
       const bbRaw     = res.headers.get("X-ATS-Breakdown-Before");
       const baRaw     = res.headers.get("X-ATS-Breakdown-After");
       const pcRaw     = res.headers.get("X-Parsed-CV");
       const domainRaw = res.headers.get("X-Domain") || "";
       const jobTitle  = res.headers.get("X-Job-Title") || "Job";
 
-      setScoreBefore(sBefore);
-      setScoreAfter(sAfter);
+      // Keep the exact ATS "before" score coming from the JobCard modal if provided.
+      if (!beforeFromModal && Number.isFinite(sBefore)) setScoreBefore(sBefore);
+      if (Number.isFinite(sAfter)) setScoreAfter(sAfter);
       if (bbRaw) setBdBefore(JSON.parse(bbRaw));
       if (baRaw) setBdAfter(JSON.parse(baRaw));
       if (pcRaw) setParsedCV(JSON.parse(pcRaw));
@@ -181,7 +194,7 @@ export default function JobBoosterApp() {
       setErrorMsg((e instanceof Error ? e.message : String(e)) || "Unknown error");
       setPhase("error");
     }
-  }, [userId, jobId, selectedFormat]);
+  }, [userId, jobId, selectedFormat, beforeFromModal]);
 
   // Apply different format instantly
   const handleApplyFormat = useCallback(async (fmt: string) => {
@@ -229,6 +242,51 @@ export default function JobBoosterApp() {
           CV Enhancer for Job Offer
         </div>
       </header>
+
+      {(scoreBefore !== null || scoreAfter !== null) && (
+        <div style={{ width:"100%", display:"flex", justifyContent:"center", marginTop:10, padding:"0 12px" }}>
+          <div style={{ width:"100%", maxWidth:420 }}>
+            <div style={{
+              background:"var(--surface)",
+              border:"1.5px solid rgba(123,47,190,.25)",
+              borderRadius:14,
+              padding:"10px 12px",
+              display:"flex",
+              flexDirection:"column",
+              alignItems:"center",
+              justifyContent:"center",
+              gap:6,
+              boxShadow:"0 2px 14px rgba(123,47,190,.08)",
+            }}>
+              <div style={{ fontSize:11, fontWeight:700, color:"var(--text-faint)", letterSpacing:".06em", textTransform:"uppercase", textAlign:"center" }}>
+                ATS score for this job
+              </div>
+              <div style={{ display:"flex", alignItems:"center", gap:8, fontFamily:"var(--font)", justifyContent:"center", flexWrap:"wrap" }}>
+                <span style={{ fontSize:12, color:"var(--text-muted)", fontWeight:600 }}>
+                  Before: <strong style={{ color:"var(--text)" }}>{scoreBefore ?? "-"}/100</strong>
+                </span>
+                <span style={{ color:"var(--text-faint)", fontSize:12 }}>→</span>
+                <span style={{ fontSize:12, color:"var(--text-muted)", fontWeight:600 }}>
+                  After: <strong style={{ color:"var(--violet)" }}>{scoreAfter ?? "-"}/100</strong>
+                </span>
+                {scoreBefore !== null && scoreAfter !== null && (
+                  <span style={{
+                    padding:"2px 8px",
+                    borderRadius:99,
+                    fontSize:11,
+                    fontWeight:700,
+                    background: scoreAfter - scoreBefore >= 0 ? "rgba(16,185,129,.1)" : "rgba(239,68,68,.08)",
+                    border: scoreAfter - scoreBefore >= 0 ? "1px solid rgba(16,185,129,.3)" : "1px solid rgba(239,68,68,.25)",
+                    color: scoreAfter - scoreBefore >= 0 ? "#059669" : "#EF4444",
+                  }}>
+                    {scoreAfter - scoreBefore >= 0 ? "+" : ""}{scoreAfter - scoreBefore}
+                  </span>
+                )}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       <main className="main-content">
 
@@ -420,7 +478,47 @@ export default function JobBoosterApp() {
                 </div>
               </div>
               <div className="dl-actions">
-                <button className="btn-download" onClick={downloadFile} type="button" disabled={applyingFormat}>
+                <button
+                  className="btn-download"
+                  onClick={downloadFile}
+                  type="button"
+                  disabled={applyingFormat}
+                  style={{
+                    display: "inline-flex",
+                    alignItems: "center",
+                    justifyContent: "center",
+                    gap: 8,
+                    minWidth: 250,
+                    padding: "12px 20px",
+                    borderRadius: 12,
+                    border: "1px solid rgba(255,255,255,.25)",
+                    background: applyingFormat
+                      ? "linear-gradient(135deg, #c9b6df 0%, #b8a4d0 100%)"
+                      : "linear-gradient(135deg, #FF2D7A 0%, #C3379B 50%, #7A3FB0 100%)",
+                    color: "#fff",
+                    fontFamily: "var(--font)",
+                    fontSize: 13,
+                    fontWeight: 800,
+                    letterSpacing: ".01em",
+                    cursor: applyingFormat ? "wait" : "pointer",
+                    boxShadow: applyingFormat
+                      ? "0 4px 14px rgba(122,63,176,.16)"
+                      : "0 10px 28px rgba(195,55,155,.34)",
+                    transition: "transform .18s ease, box-shadow .18s ease, opacity .18s ease",
+                    opacity: applyingFormat ? 0.92 : 1,
+                  }}
+                  onMouseEnter={(e) => {
+                    if (applyingFormat) return;
+                    e.currentTarget.style.transform = "translateY(-1px)";
+                    e.currentTarget.style.boxShadow = "0 14px 34px rgba(195,55,155,.42)";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.transform = "translateY(0)";
+                    e.currentTarget.style.boxShadow = applyingFormat
+                      ? "0 4px 14px rgba(122,63,176,.16)"
+                      : "0 10px 28px rgba(195,55,155,.34)";
+                  }}
+                >
                   <Download size={15} />{applyingFormat ? "Generating…" : "Download Enhanced CV (.docx)"}
                 </button>
                 <button className="btn-reset btn-reset-inline" onClick={() => setPhase("job")} type="button">

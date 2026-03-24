@@ -36,7 +36,7 @@ from pydantic import BaseModel
 from sentence_transformers import SentenceTransformer
 
 import matcher as mtch
-from database import insert_job, upsert_user
+from database import get_user, insert_job, upsert_user
 from llm_extractor import extract_with_llm
 from scraper_utils import extract_tech_from_description
 # Import scrapers directly to avoid circular imports.
@@ -70,7 +70,10 @@ COSINE_THRESHOLD           = 0.60
 COSINE_THRESHOLD_EMPLOITIC = 0.60
 MAX_AGE_DAYS               = 45
 LLM_CONCURRENCY            = 4
-NUM_SOURCES                = 10   # Indeed, LinkedIn, WTTJ (Lever commented out — was blocking WTTJ)
+# Keep this in sync with actually launched sources below.
+# We avoid hard-coding this value in the loop-end condition.
+NUM_SOURCES                = 9
+SCRAPER_TIMEOUT_SECONDS    = 75
 
 SHARED_HEADERS = {
     "User-Agent": (
@@ -379,7 +382,6 @@ async def pipeline(user_id: int = 1):
     logger.info(f"[pipeline] START — user_id={user_id} save_to_db={user_id > 0}")
 
     # ── Étape 1-2-3 : Charger profil depuis CosmosDB (plus d'extraction LLM) ──
-    from database import get_user
     user = await get_user(user_id) if user_id > 0 else {}
     if not user:
         logger.error(f"[pipeline] user_id={user_id} not found in DB — abort")
@@ -748,7 +750,11 @@ async def pipeline(user_id: int = 1):
             """
             job_count_source = 0
             try:
-                jobs = await scrape_fn(cv_title, session_)
+                # Prevent one slow source from blocking the whole pipeline forever.
+                jobs = await asyncio.wait_for(
+                    scrape_fn(cv_title, session_),
+                    timeout=SCRAPER_TIMEOUT_SECONDS,
+                )
                 for job in jobs:
                     job_count_source += 1
                     # ── SSE immédiat : job détecté (avant filtre cosine) ──────
@@ -763,6 +769,8 @@ async def pipeline(user_id: int = 1):
                     })
                     # ── Cosine + enrich en parallèle ──────────────────────────
                     await handle_job(job, name)
+            except asyncio.TimeoutError:
+                logger.warning(f"[{name}] scraper timeout after {SCRAPER_TIMEOUT_SECONDS}s")
             except Exception as e:
                 logger.error(f"[{name}] scraper error: {e}")
             finally:
@@ -774,20 +782,22 @@ async def pipeline(user_id: int = 1):
 
         # ── Active sources ────────────────────────────────────────────────────
         # Dedupe: same (title, company) from multiple sources → one row (first wins).
-        # Start LinkedIn first so it’s more likely to be the “original” when duplicated.
-        #
-        asyncio.create_task(run_source("aijobs",     scrape_aijobs,     session))
-        asyncio.create_task(run_source("remoteok",   scrape_remoteok,   session))
-        asyncio.create_task(run_source("tanitjobs",  scrape_tanitjobs,  session))
-        asyncio.create_task(run_source("greenhouse", scrape_greenhouse, session))
-        asyncio.create_task(run_source("eluta",      scrape_eluta,      session))
-        asyncio.create_task(run_source("whatjobs",   scrape_whatjobs,   session))
-        #asyncio.create_task(run_source("emploitic",  scrape_emploitic,  session))
-        # --- Active: Indeed, LinkedIn, WTTJ (Lever commented — was blocking WTTJ) ---
-        asyncio.create_task(run_source("linkedin", scrape_linkedin, session))
-        asyncio.create_task(run_source("indeed",   scrape_indeed,  session))
-        asyncio.create_task(run_source("lever",    scrape_lever,    session))
-        asyncio.create_task(run_source("wttj",     scrape_wttj,    session))
+        # NOTE: lever was observed to occasionally block the global scan flow,
+        # so it is intentionally disabled for now.
+        active_sources = [
+            ("aijobs",     scrape_aijobs),
+            ("remoteok",   scrape_remoteok),
+            ("tanitjobs",  scrape_tanitjobs),
+            ("greenhouse", scrape_greenhouse),
+            ("eluta",      scrape_eluta),
+            ("whatjobs",   scrape_whatjobs),
+            ("linkedin",   scrape_linkedin),
+            ("indeed",     scrape_indeed),
+            ("wttj",       scrape_wttj),
+        ]
+        num_sources = len(active_sources)
+        for source_name, source_fn in active_sources:
+            asyncio.create_task(run_source(source_name, source_fn, session))
 
         # ── Boucle SSE principale ─────────────────────────────────────────────
         job_count = 0
@@ -805,7 +815,7 @@ async def pipeline(user_id: int = 1):
                 job_count += 1
                 yield sse(item)
 
-            if scrapers["done"] >= NUM_SOURCES:
+            if scrapers["done"] >= num_sources:
                 all_done["v"] = True
                 if pending["n"] <= 0:
                     logger.info(f"[pipeline] END — {job_count} jobs (user_id={user_id})")
@@ -819,29 +829,39 @@ async def pipeline(user_id: int = 1):
 #  Route FastAPI
 # ═══════════════════════════════════════════════════════════════════════════════
 
-    from database import get_user, upsert_user   # upsert_user déjà importé ? sinon ajouter
- 
 @scraping_router.post("/scan")
 async def scan(req: ScanRequest):
     logger.info(f"[/scan] POST — user_id={req.user_id}")
- 
-        # ── Sauvegarder cv_raw_text si fourni dans la requête ──────────────
-        # Cela permet à /api/ats-score de retrouver le texte CV depuis CosmosDB
-    if req.cv_raw_text and req.cv_raw_text.strip() and req.user_id > 0:
+
+    async def _safe_scan_stream():
         try:
-            user = await get_user(req.user_id)
-            if user:
-                # On met à jour uniquement cv_raw_text, on garde tous les autres champs
-                await upsert_user(req.user_id, {
-                    **{k: v for k, v in user.items() if v is not None},
-                    "cv_raw_text": req.cv_raw_text.strip(),
-                })
-                logger.info(f"[/scan] cv_raw_text saved — user_id={req.user_id} ({len(req.cv_raw_text)} chars)")
+            if req.user_id <= 0:
+                yield sse({"event": "error", "message": "Invalid user_id"})
+                yield sse({"event": "done", "total": 0, "error": True})
+                return
+
+            # Save cv_raw_text if provided (non-blocking best effort)
+            if req.cv_raw_text and req.cv_raw_text.strip():
+                try:
+                    user = await get_user(req.user_id)
+                    if user:
+                        await upsert_user(req.user_id, {
+                            **{k: v for k, v in user.items() if v is not None},
+                            "cv_raw_text": req.cv_raw_text.strip(),
+                        })
+                        logger.info(f"[/scan] cv_raw_text saved — user_id={req.user_id} ({len(req.cv_raw_text)} chars)")
+                except Exception as e:
+                    logger.warning(f"[/scan] cv_raw_text save failed (non-blocking): {e}")
+
+            async for event in pipeline(req.user_id):
+                yield event
         except Exception as e:
-            logger.warning(f"[/scan] cv_raw_text save failed (non-blocking): {e}")
- 
+            logger.exception("[/scan] unhandled error: %s", e)
+            yield sse({"event": "error", "message": f"Scan pipeline crashed: {str(e)}"})
+            yield sse({"event": "done", "total": 0, "error": True})
+
     return StreamingResponse(
-        pipeline(req.user_id),
+        _safe_scan_stream(),
         media_type = "text/event-stream",
         headers    = {
             "Cache-Control":     "no-cache",

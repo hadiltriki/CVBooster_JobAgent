@@ -6,26 +6,21 @@ function Redirect() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const userId = searchParams.get("user_id") || "";
+  const forceScan = searchParams.get("scan") === "1";
 
   useEffect(() => {
     if (!userId) return;
     sessionStorage.setItem("jobscan_user_id", userId);
 
-    async function check() {
-      try {
-        const hasJobsRes = await fetch(`/api/user/${userId}/has_jobs`);
-        const hasJobsData = await hasJobsRes.json();
-        if (hasJobsData.has_jobs) {
-          router.replace(`/app?user_id=${userId}`);
-        } else {
-          router.replace(`/app?user_id=${userId}&scan=1`);
-        }
-      } catch {
-        router.replace(`/app?user_id=${userId}&scan=1`);
-      }
+    // URL behavior:
+    // - /jobs-search?user_id=...&scan=1 => force fresh scraping pipeline
+    // - /jobs-search?user_id=...        => load dashboard from DB only
+    if (forceScan) {
+      router.replace(`/app?user_id=${userId}&scan=1`);
+      return;
     }
-    check();
-  }, []);
+    router.replace(`/app?user_id=${userId}`);
+  }, [userId, forceScan, router]);
 
   return (
     <div style={{ minHeight: "100vh", display: "flex", alignItems: "center", justifyContent: "center" }}>

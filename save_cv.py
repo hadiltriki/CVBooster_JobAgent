@@ -201,6 +201,90 @@ def _build_bullets_str(cv_structured: dict, existing: dict) -> str:
     return existing.get("bullets", "")
 
 
+def _merge_extra_into_raw_text(raw_text: str, extra_data: dict) -> str:
+    """
+    Append user-provided missing sections to raw CV text so downstream
+    extraction/enhancement can actually use them.
+    """
+    if not isinstance(extra_data, dict) or not extra_data:
+        return raw_text
+
+    blocks: list[str] = []
+
+    # Languages
+    langs = extra_data.get("languages", [])
+    if isinstance(langs, list):
+        lang_lines = []
+        for row in langs:
+            if not isinstance(row, dict):
+                continue
+            language = str(row.get("language", "")).strip()
+            level = str(row.get("level", "")).strip()
+            if language and level:
+                lang_lines.append(f"- {language} ({level})")
+            elif language:
+                lang_lines.append(f"- {language}")
+        if lang_lines:
+            blocks.append("LANGUAGES\n" + "\n".join(lang_lines))
+
+    # Education
+    education_rows = extra_data.get("education", [])
+    if isinstance(education_rows, list):
+        edu_lines = []
+        for row in education_rows:
+            if not isinstance(row, dict):
+                continue
+            degree = str(row.get("degree", "")).strip()
+            university = str(row.get("university", "")).strip()
+            start = str(row.get("start", "")).strip()
+            end = str(row.get("end", "")).strip()
+            present = bool(row.get("present", False))
+            period = ""
+            if start or end or present:
+                period_end = "Present" if present else end
+                period = f" ({start} - {period_end})".strip()
+            if degree or university:
+                main = " - ".join(part for part in [degree, university] if part)
+                edu_lines.append(f"- {main}{period}")
+        if edu_lines:
+            blocks.append("EDUCATION\n" + "\n".join(edu_lines))
+
+    # Experience
+    experience_rows = extra_data.get("experience", [])
+    if isinstance(experience_rows, list):
+        exp_lines = []
+        for row in experience_rows:
+            if not isinstance(row, dict):
+                continue
+            title = str(row.get("title", "")).strip()
+            company = str(row.get("company", "")).strip()
+            location = str(row.get("location", "")).strip()
+            description = str(row.get("description", "")).strip()
+            start = str(row.get("start", "")).strip()
+            end = str(row.get("end", "")).strip()
+            present = bool(row.get("present", False))
+
+            if not (title or company):
+                continue
+
+            role_company = " - ".join(part for part in [title, company] if part)
+            period = ""
+            if start or end or present:
+                period_end = "Present" if present else end
+                period = f" ({start} - {period_end})".strip()
+            location_part = f" | {location}" if location else ""
+            exp_lines.append(f"- {role_company}{period}{location_part}")
+            if description:
+                exp_lines.append(f"  {description}")
+        if exp_lines:
+            blocks.append("PROFESSIONAL EXPERIENCE\n" + "\n".join(exp_lines))
+
+    if not blocks:
+        return raw_text
+
+    return raw_text.rstrip() + "\n\n" + "\n\n".join(blocks) + "\n"
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CosmosDB helper
 # ─────────────────────────────────────────────────────────────────────────────
@@ -438,10 +522,11 @@ async def save_cv(
     except Exception:
         extra = {}
 
-    domain = detect_domain(raw_text)
+    merged_raw_text = _merge_extra_into_raw_text(raw_text, extra)
+    domain = detect_domain(merged_raw_text)
 
     try:
-        cv_structured = _extract_cv_structured(raw_text)
+        cv_structured = _extract_cv_structured(merged_raw_text)
         log.info("✓ CV structured — role=%s seniority=%s",
                  cv_structured.get("role"), cv_structured.get("seniority"))
     except Exception as e:
@@ -471,7 +556,7 @@ async def save_cv(
         labs_data=labs,
         certs_data=certs,
         extra_data=extra,
-        raw_text=raw_text,
+        raw_text=merged_raw_text,
     )
 
     try:

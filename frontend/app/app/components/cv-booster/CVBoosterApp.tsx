@@ -327,7 +327,7 @@ useEffect(() => {
               <div style={{ display: "flex", gap: 12, flexWrap: "wrap", justifyContent: "center" }}>
                 <button
                   type="button"
-                  onClick={() => window.location.href = `/jobs-search?user_id=${userId}`}
+                  onClick={() => window.location.href = `/jobs-search?user_id=${userId}&scan=1`}
                   style={{
                     display: "flex", alignItems: "center", gap: 9,
                     padding: "14px 32px", borderRadius: 14,
