@@ -23,11 +23,15 @@ from dotenv import load_dotenv
 
 from scraper_utils import (
     MAX_AGE_DAYS, MAX_RETRIES, RETRY_WAIT,
-    DELAY_BETWEEN_PAGES, WARMUP_DELAY, HTTP_TIMEOUT,
+    WARMUP_DELAY, HTTP_TIMEOUT,
     BROWSER_HEADERS,
     _parse_date, _age_label, _too_old, _infer_remote,
     _cv_title_to_tags, _extract_tech_keywords,
 )
+
+# Override: délai plus court pour aijobs direct (la valeur globale de 8s est trop lente)
+DELAY_BETWEEN_PAGES = 1.5   # 1.5s × 8 pages max = 12s, bien sous le timeout de 75s
+MAX_PAGES_DIRECT    = 8     # 8 pages × 18 jobs = ~144 jobs max, suffisant
 
 load_dotenv()
 
@@ -150,6 +154,14 @@ async def _scrape_aijobs_google_web(query: str) -> list[dict]:
                         max_results    = 50,
                     )
                 )
+            except RuntimeError as e:
+                err_msg = str(e)
+                if "403" in err_msg or "401" in err_msg or "forbidden" in err_msg.lower() or "unauthorized" in err_msg.lower():
+                    # Clé SerpApi invalide/quota épuisé → inutile d'essayer les autres queries
+                    print(f"  [aijobs/google_web] SerpApi error: {err_msg.splitlines()[0]}")
+                    return []
+                print(f"  [aijobs/google_web] exception: {e}")
+                continue
             except Exception as e:
                 print(f"  [aijobs/google_web] exception: {e}")
                 continue
@@ -269,6 +281,16 @@ def _parse_job_links(html: str) -> list[dict]:
         if not title or len(title) < 3 or title.lower() in SKIP:
             continue
 
+        # Nettoyer le bruit du titre : "AI Engineer 1D Full Time Salary:\n..." → "AI Engineer"
+        title = re.split(
+            r'\s+\d+[DdWwMmHh]\b|\s+Full[\s-]Time|\s+Part[\s-]Time'
+            r'|\s+Salary\s*:|\s+Remote\s*$|\s+Contract\b',
+            title, maxsplit=1, flags=re.IGNORECASE
+        )[0].strip()
+        title = " ".join(title.split())  # normaliser espaces/newlines
+        if not title or len(title) < 3:
+            continue
+
         company = time_ago = ""
         parent  = link.parent
         if parent:
@@ -301,9 +323,20 @@ def _parse_job_links(html: str) -> list[dict]:
     return results
 
 
-async def _scrape_aijobs_direct(session: aiohttp.ClientSession) -> list[dict]:
+async def _scrape_aijobs_direct(session: aiohttp.ClientSession, query: str = "") -> list[dict]:
+    """
+    Scrape aijobs.ai en HTTP direct, avec filtre par query si disponible.
+    URL de recherche : https://aijobs.ai/jobs?search=<query>&page=N
+    Sans query → liste générale /jobs?page=N (moins pertinent mais fonctionnel).
+    """
+    from urllib.parse import quote_plus
+
     listings: list[dict] = []
     seen:     set[str]   = set()
+
+    # Construire le paramètre de recherche depuis la query CV
+    search_term = _extract_tech_keywords(query).strip() if query else ""
+    search_param = f"&search={quote_plus(search_term)}" if search_term else ""
 
     print(f"  [aijobs/direct] warm-up {AIJOBS_BASE} ...")
     html = await _fetch_aijobs_page(AIJOBS_BASE)
@@ -313,7 +346,14 @@ async def _scrape_aijobs_direct(session: aiohttp.ClientSession) -> list[dict]:
     page_num = 0
     while True:
         page_num += 1
-        url = f"{AIJOBS_BASE}/jobs" if page_num == 1 else f"{AIJOBS_BASE}/jobs?page={page_num}"
+        # Limite de pages pour rester sous le timeout global (75s)
+        if page_num > MAX_PAGES_DIRECT:
+            print(f"  [aijobs/direct] STOP — limite {MAX_PAGES_DIRECT} pages atteinte")
+            break
+        if page_num == 1:
+            url = f"{AIJOBS_BASE}/jobs?{search_param.lstrip('&')}" if search_param else f"{AIJOBS_BASE}/jobs"
+        else:
+            url = f"{AIJOBS_BASE}/jobs?page={page_num}{search_param}"
         if page_num > 1:
             await asyncio.sleep(DELAY_BETWEEN_PAGES)
 
@@ -370,6 +410,6 @@ async def scrape_aijobs(query: str, session: aiohttp.ClientSession) -> list[dict
         print(f"  [aijobs] google_web 0 résultats → fallback HTTP direct")
 
     print(f"  [aijobs] Mode: HTTP direct")
-    listings = await _scrape_aijobs_direct(session)
+    listings = await _scrape_aijobs_direct(session, query=query)
     print(f"[aijobs] TOTAL (direct): {len(listings)}")
     return listings

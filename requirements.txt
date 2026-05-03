@@ -55,3 +55,9 @@ numpy==2.4.3
 python-dotenv>=1.2.2
 fastapi>=0.101.0
 uvicorn>=0.23.2
+python-dotenv
+azure-cosmos
+python-docx
+requests
+pdfplumber
+python-multipart

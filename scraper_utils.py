@@ -106,7 +106,82 @@ def _parse_date(text: str) -> datetime | None:
 
     return None
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  LLM SKILLS EXTRACTOR — pour descriptions narratives (ex: keejob)
+# ══════════════════════════════════════════════════════════════════════════════
 
+import os as _os
+
+async def extract_skills_with_llm(description: str, max_skills: int = 15) -> str:
+    """
+    Utilise Azure OpenAI pour extraire les compétences techniques depuis
+    une description narrative (français ou anglais).
+    
+    Transforme des phrases comme :
+      "Bonnes connaissances en réseaux TCP/IP, LAN/WAN, systèmes d'exploitation..."
+    En tags courts :
+      "TCP/IP, LAN/WAN, Windows, Linux, Hardware Maintenance, Helpdesk"
+    
+    Retourne une string CSV normalisée, ou "" si LLM indisponible.
+    Fallback silencieux vers extract_tech_from_description() si LLM échoue.
+    """
+    if not description or len(description.strip()) < 30:
+        return ""
+
+    # Imports locaux pour éviter les imports circulaires
+    try:
+        from openai import AsyncAzureOpenAI
+    except ImportError:
+        return extract_tech_from_description(description, max_skills)
+
+    endpoint = _os.getenv("AZURE_OPENAI_ENDPOINT", "")
+    api_key  = _os.getenv("AZURE_OPENAI_API_KEY", "")
+    version  = _os.getenv("AZURE_OPENAI_API_VERSION", "2024-08-01-preview")
+    deploy   = _os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME") or _os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-4o-mini")
+
+    if not endpoint or not api_key:
+        # Pas de LLM configuré → fallback regex
+        return extract_tech_from_description(description, max_skills)
+
+    prompt = f"""Extract ALL technical skills, tools, and competencies from this job description.
+Return ONLY a comma-separated list of short skill names (1-4 words each, in English).
+Normalize: "Réseaux TCP/IP" → "TCP/IP", "maintenance matériel" → "Hardware Maintenance", 
+"systèmes d'exploitation" → "Operating Systems", "support technique" → "Helpdesk Support".
+Include: programming languages, frameworks, tools, protocols, methodologies, certifications.
+Do NOT include soft skills (teamwork, communication) unless explicitly technical.
+Return max {max_skills} skills. If none found, return empty string.
+
+Job description:
+{description[:2000]}
+
+Skills (comma-separated):"""
+
+    try:
+        client = AsyncAzureOpenAI(
+            azure_endpoint=endpoint,
+            api_key=api_key,
+            api_version=version,
+        )
+        async with client as az:
+            resp = await az.chat.completions.create(
+                model=deploy,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=150,
+                temperature=0,
+            )
+        raw = resp.choices[0].message.content.strip()
+        # Nettoyer les éventuels backticks ou guillemets
+        raw = raw.strip('`"\'')
+        # Normaliser : supprimer les lignes vides, garder seulement la première ligne
+        lines = [l.strip() for l in raw.split('\n') if l.strip()]
+        skills_str = lines[0] if lines else ""
+        # Validation : doit ressembler à une liste CSV
+        if skills_str and len(skills_str) > 200:
+            skills_str = skills_str[:200]
+        return skills_str
+    except Exception:
+        # Fallback silencieux vers regex
+        return extract_tech_from_description(description, max_skills)
 def _age_label(dt: datetime | None) -> str:
     """Jours EXACTS : "11 days ago" et non "1 week ago"."""
     if dt is None:
@@ -118,7 +193,8 @@ def _age_label(dt: datetime | None) -> str:
 
 
 def _too_old(dt: datetime | None) -> bool:
-    return dt is not None and (datetime.now() - dt).days > MAX_AGE_DAYS
+    """Retourne True si l'offre a >= MAX_AGE_DAYS jours (stop scraping)."""
+    return dt is not None and (datetime.now() - dt).days >= MAX_AGE_DAYS
 
 
 def _infer_remote(text: str) -> str:

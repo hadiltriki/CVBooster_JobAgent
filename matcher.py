@@ -520,8 +520,9 @@ def compute_skills_gap(cv_structured: dict, job_details: dict) -> dict:
 
     if not job_skills:
         req_csv    = job_details.get("skills_req", "") or ""
-        job_skills = [s.strip() for s in req_csv.split(",") if s.strip()
-                      and s.strip().lower() != "not specified"]
+        _SKIP = {"not specified", "empty string", "none", "n/a", "na", "null", "-"}
+        job_skills = [s.strip() for s in req_csv.split(",")
+              if s.strip() and s.strip().lower() not in _SKIP]
 
     if not job_skills:
         return {"missing": [], "matched": [], "coverage": 1.0, "total": 0}

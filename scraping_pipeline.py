@@ -38,13 +38,14 @@ from sentence_transformers import SentenceTransformer
 import matcher as mtch
 from database import get_user, insert_job, upsert_user
 from llm_extractor import extract_with_llm
-from scraper_utils import extract_tech_from_description
+from scraper_utils import extract_tech_from_description, extract_skills_with_llm
 # Import scrapers directly to avoid circular imports.
 # (scraper.py imports scraper_whatjobs.py, so importing scrape_whatjobs
 #  via scraper.py from within scraping_pipeline.py creates a cycle.)
 # --- Commented out (enable when re-adding these sources) ---
 from scraper_remoteok   import scrape_remoteok                                 # ✅ ACTIVE
-#from scraper_emploitic import scrape_emploitic, _scrape_emploitic_fetch_one  # commenté
+#from scraper_emploitic      import scrape_emploitic, _scrape_emploitic_fetch_one
+
 from scraper_whatjobs  import scrape_whatjobs                                # commenté
 from scraper_aijobs    import scrape_aijobs                                  # commenté
 from scraper_tanitjobs import scrape_tanitjobs
@@ -55,7 +56,10 @@ from scraper_indeed   import scrape_indeed
 from scraper_linkedin import scrape_linkedin
 from scraper_lever    import scrape_lever
 from scraper_wttj     import scrape_wttj
-
+from scraper_keejob import scrape_keejob  
+from scraper_workopolis import scrape_workopolis
+from scraper_datajobs   import scrape_datajobs  
+from scraper_weworkremotely import scrape_weworkremotely
 try:
     from xai_explainer import explain_job_match, EXPLAINABLE_AI_ENABLED
 except Exception:
@@ -68,11 +72,12 @@ scraping_router  = APIRouter(tags=["Scraping"])
 # ── Config ────────────────────────────────────────────────────────────────────
 COSINE_THRESHOLD           = 0.60
 COSINE_THRESHOLD_EMPLOITIC = 0.60
+COSINE_THRESHOLD_KEEJOB    = 0.60  
 MAX_AGE_DAYS               = 45
 LLM_CONCURRENCY            = 4
 # Keep this in sync with actually launched sources below.
 # We avoid hard-coding this value in the loop-end condition.
-NUM_SOURCES                = 9
+NUM_SOURCES                = 14
 SCRAPER_TIMEOUT_SECONDS    = 75
 
 SHARED_HEADERS = {
@@ -427,11 +432,22 @@ async def pipeline(user_id: int = 1):
         async def handle_job(job: dict, source: str):
             """Filtre par cosine threshold puis lance l'enrichissement."""
             job["source"] = source
-            threshold = COSINE_THRESHOLD_EMPLOITIC if source == "emploitic" else COSINE_THRESHOLD
+            if source == "emploitic":
+                threshold = COSINE_THRESHOLD_EMPLOITIC
+            elif source == "keejob":
+                threshold = COSINE_THRESHOLD_KEEJOB
+            else:
+                threshold = COSINE_THRESHOLD
             job_vec = await asyncio.to_thread(
                 lambda: EMBED_MODEL.encode(job["title"], convert_to_numpy=True)
             )
             cosine = cosine_sim(cv_vec, job_vec)
+            logger.info(
+                f"  [cosine] '{job.get('title','')[:40]}' [{source}] "
+                f"cos={cosine:.3f} seuil={threshold} "
+                f"→ {'✅ PASS' if cosine >= threshold else '❌ skip'}"
+            )
+
             if cosine < threshold:
                 return
             pending["n"] += 1
@@ -617,6 +633,95 @@ async def pipeline(user_id: int = 1):
                             "all_skills":  job.get("_wttj_skills", ""),
                             "tags":        "",
                         }
+                    elif source == "workopolis":
+                        from scraper_workopolis import (
+                            fetch_workopolis_detail,
+                            parse_workopolis_detail,
+                        )
+                        vd = await fetch_workopolis_detail(
+                            job.get("_wp_job_key", ""),
+                            job.get("_wp_query", ""),
+                            session,
+                        )
+                        details = parse_workopolis_detail(job, vd)
+                    elif source == "datajobs":
+                        from scraper_datajobs import parse_datajobs_detail
+                        details = parse_datajobs_detail(job, "")
+                        # La description et les skills sont déjà dans le job
+                        # car scrape_datajobs fetch la page detail au moment du yield
+                        if not details.get("description") and job.get("_dj_description"):
+                            details["description"] = job["_dj_description"]
+                        if not details.get("skills_req") and job.get("_dj_skills"):
+                            details["skills_req"] = job["_dj_skills"]
+                            details["all_skills"]  = job["_dj_skills"]
+                    elif source == "weworkremotely":
+                        from scraper_weworkremotely import fetch_weworkremotely_detail
+                        description = await fetch_weworkremotely_detail(
+                            job.get("url", ""),
+                            session,
+                        )
+                        details = {
+                            "title":       job.get("title", ""),
+                            "industry":    job.get("company", ""),
+                            "location":    job.get("location", ""),
+                            "remote":      job.get("remote", ""),
+                            "salary":      "Not specified",
+                            "contract":    job.get("_wwr_contract", ""),
+                            "experience":  "",
+                            "education":   "",
+                            "pub_date":    job.get("time_ago", ""),
+                            "expired":     "",
+                            "description": description,
+                            "skills_req":  "",
+                            "skills_bon":  "",
+                            "all_skills":  "",
+                            "tags":        job.get("_wwr_categories", ""),
+                        }
+
+                    elif source == "keejob":
+                        from scraper_keejob import _fetch_keejob_detail
+                        try:
+                            full = await _fetch_keejob_detail(job["url"], session)
+                        except Exception as detail_exc:
+                            logger.error(
+                                f"  [keejob/detail] exception pour "
+                                f"'{job.get('title','')[:40]}': {detail_exc}"
+                            )
+                            full = None
+ 
+                        if full:
+                            details = full
+                            logger.info(
+                                f"  [keejob/detail] ✅ '{details.get('title','')[:35]}' | "
+                                f"company='{details.get('industry','')}' | "
+                                f"loc='{details.get('location','')}' | "
+                                f"salary='{details.get('salary','')}'"
+                            )
+                        else:
+                            # Fallback : données du listing page
+                            logger.warning(
+                                f"  [keejob/detail] ⚠ fallback listing pour "
+                                f"'{job.get('title','')[:40]}'"
+                            )
+                            description     = job.get("_keejob_description", "")
+                            skills_fallback = extract_tech_from_description(description) if description else ""
+                            details = {
+                                "title":       job.get("title", ""),
+                                "industry":    job.get("company", ""),
+                                "location":    job.get("location", ""),
+                                "remote":      job.get("remote", ""),
+                                "salary":      job.get("salary", "Non spécifié"),
+                                "contract":    job.get("_keejob_contract", ""),
+                                "experience":  job.get("_keejob_experience", ""),
+                                "education":   "",
+                                "pub_date":    job.get("time_ago", ""),
+                                "expired":     "",
+                                "description": description,
+                                "skills_req":  skills_fallback,
+                                "skills_bon":  "",
+                                "all_skills":  skills_fallback,
+                                "tags":        job.get("_keejob_industry", ""),
+                            }
 
                     else:
                         # aijobs / remoteok → extraction LLM générique
@@ -630,8 +735,12 @@ async def pipeline(user_id: int = 1):
 
                     # Backfill skills from description when source provides no structured skills
                     # (for gap computation and "skills in demand" on job card)
+                    # BUG FIX : was using only regex (extract_tech_from_description).
+                    # Now uses LLM first (handles narrative French text) with regex fallback.
                     if not details.get("skills_req") and not details.get("all_skills") and details.get("description"):
-                        backfill = extract_tech_from_description(details["description"])
+                        backfill = await extract_skills_with_llm(details["description"], max_skills=12)
+                        if not backfill:
+                            backfill = extract_tech_from_description(details["description"])
                         if backfill:
                             details["skills_req"] = backfill
                             details["all_skills"] = backfill
@@ -743,32 +852,54 @@ async def pipeline(user_id: int = 1):
 
         async def run_source(name: str, scrape_fn, session_):
             """
-            Lance un scraper et traite chaque job EN TEMPS RÉEL dès qu'il est détecté.
-            Recherche mondiale — aucun filtre de localisation appliqué.
-            Chaque job est notifié immédiatement au frontend via SSE 'job_found',
-            puis traité par handle_job() (cosine → enrich → score → SSE 'job').
+            Lance un scraper et traite chaque job EN TEMPS RÉEL.
+
+            Deux modes selon le scraper :
+              • Async generator (keejob)  → yield job par job, traitement immédiat
+              • Coroutine renvoyant liste (autres) → attend la liste puis traite
+
+            Pour chaque job détecté :
+              1. SSE "job_found" → dashboard notifié immédiatement
+              2. handle_job()   → cosine >= 0.60 → enrich() → SSE "job" + DB save
             """
             job_count_source = 0
             try:
-                # Prevent one slow source from blocking the whole pipeline forever.
-                jobs = await asyncio.wait_for(
-                    scrape_fn(cv_title, session_),
-                    timeout=SCRAPER_TIMEOUT_SECONDS,
-                )
-                for job in jobs:
-                    job_count_source += 1
-                    # ── SSE immédiat : job détecté (avant filtre cosine) ──────
-                    await result_q.put({
-                        "event":    "job_found",
-                        "source":   name,
-                        "title":    job.get("title", ""),
-                        "company":  job.get("company", ""),
-                        "url":      job.get("url", ""),
-                        "time_ago": job.get("time_ago", ""),
-                        "count":    job_count_source,
-                    })
-                    # ── Cosine + enrich en parallèle ──────────────────────────
-                    await handle_job(job, name)
+                gen = scrape_fn(cv_title, session_)
+
+                # ── Async generator (ex: keejob) ──────────────────────────────
+                # yield job par job → traitement immédiat sans attendre la fin
+                if hasattr(gen, '__aiter__'):
+                    async for job in gen:
+                        job_count_source += 1
+                        # SSE immédiat : notifie le dashboard avant le filtre cosine
+                        await result_q.put({
+                            "event":    "job_found",
+                            "source":   name,
+                            "title":    job.get("title", ""),
+                            "company":  job.get("company", ""),
+                            "url":      job.get("url", ""),
+                            "time_ago": job.get("time_ago", ""),
+                            "count":    job_count_source,
+                        })
+                        # Cosine filter + enrich (async task en parallèle)
+                        await handle_job(job, name)
+
+                # ── Coroutine renvoyant liste (autres scrapers) ───────────────
+                else:
+                    jobs = await asyncio.wait_for(gen, timeout=SCRAPER_TIMEOUT_SECONDS)
+                    for job in jobs:
+                        job_count_source += 1
+                        await result_q.put({
+                            "event":    "job_found",
+                            "source":   name,
+                            "title":    job.get("title", ""),
+                            "company":  job.get("company", ""),
+                            "url":      job.get("url", ""),
+                            "time_ago": job.get("time_ago", ""),
+                            "count":    job_count_source,
+                        })
+                        await handle_job(job, name)
+
             except asyncio.TimeoutError:
                 logger.warning(f"[{name}] scraper timeout after {SCRAPER_TIMEOUT_SECONDS}s")
             except Exception as e:
@@ -794,6 +925,11 @@ async def pipeline(user_id: int = 1):
             ("linkedin",   scrape_linkedin),
             ("indeed",     scrape_indeed),
             ("wttj",       scrape_wttj),
+            ("lever",        scrape_lever),
+            ("keejob",     scrape_keejob),
+            ("workopolis",   scrape_workopolis),
+            ("datajobs",   scrape_datajobs), 
+            ("weworkremotely", scrape_weworkremotely),
         ]
         num_sources = len(active_sources)
         for source_name, source_fn in active_sources:

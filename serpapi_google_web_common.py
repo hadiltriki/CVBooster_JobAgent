@@ -61,6 +61,14 @@ def fetch_json(url: str, *, timeout_s: int = 60, retries: int = 3) -> Any:
                     "Fix: set SERPAPI_API_KEY in the environment or pass --api-key.\n"
                     f"Request (redacted): {_redact_api_key(url)}"
                 ) from e
+            # 403 = clé invalide, quota dépassé ou IP bannie → inutile de réessayer
+            if getattr(e, "code", None) == 403:
+                raise RuntimeError(
+                    "SerpApi request forbidden (HTTP 403). "
+                    "Your API key is invalid, your quota is exhausted, or your IP is blocked.\n"
+                    "Fix: check your SerpApi account at https://serpapi.com/dashboard\n"
+                    f"Request (redacted): {_redact_api_key(url)}"
+                ) from e
             wait_s = min(10, 1.5**attempt)
             logging.warning(f"Fetch failed (attempt {attempt}/{retries}): {e}. Sleeping {wait_s:.1f}s")
             time.sleep(wait_s)
